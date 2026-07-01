@@ -10,6 +10,7 @@ from urllib.parse import urljoin
 
 import httpx
 from selectolax.parser import HTMLParser
+from aiolimiter import AsyncLimiter
 
 # ==========================================
 # 全域常數設定
@@ -69,6 +70,10 @@ class BookScraper:
         }
         # 限制最大併發數，避免被伺服器擋 IP
         self.semaphore = asyncio.Semaphore(max_concurrency)
+
+        # 🌟 初始化速率限制器：例如「每 2 秒最多發送 3 個請求」
+        # 第一個參數 max_rate 是請求數，第二個參數 time_period 是秒數
+        self.rate_limiter = AsyncLimiter(max_rate=3, time_period=3)
         
         # 啟動時載入歷史紀錄，實作斷點續傳
         self.scraped_urls = self._init_csv_and_load_state()
@@ -107,17 +112,22 @@ class BookScraper:
         """發送 HTTP 請求，內建錯誤捕捉與自動重試機制"""
         for attempt in range(1, self.max_retries + 1):
             try:
-                # 加入隨機延遲，模擬人類行為
-                await asyncio.sleep(random.uniform(1, 3))
-                response = await client.get(url)
-                response.raise_for_status() 
-                return response.text
+                # 🌟 取代原本的 asyncio.sleep，改用 rate_limiter 做上下文管理器
+                # 當請求速度超過設定值時，程式會自動在這裡「優雅地暫停等待」，直到獲取發送許可
+                async with self.rate_limiter:
+                    response = await client.get(url)
+                    response.raise_for_status() 
+                    return response.text
                 
             except httpx.HTTPError as exc:
                 logger.warning(f"請求失敗 (嘗試 {attempt}/{self.max_retries}) [{url}]: {exc}")
                 if attempt == self.max_retries:
                     logger.error(f"放棄請求，已達最大重試次數 [{url}]")
                     return None
+                
+                # 若失敗需要重試，這裡可以保留一點隨機退避時間 (Exponential Backoff)
+                await asyncio.sleep(random.uniform(1, 2) * attempt)
+
             except Exception as exc:
                 logger.exception(f"發生未預期錯誤 [{url}]: {exc}") 
                 return None
